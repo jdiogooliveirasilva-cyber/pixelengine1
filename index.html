@@ -324,7 +324,7 @@
 <body>
 <div id="app">
   <div id="toolbar">
-    <span class="logo">⬢ PIXEL ENGINE <span style="color:#9d7dff;font-size:11px;font-weight:600;letter-spacing:1px">v6.2.13 PRO</span></span>
+    <span class="logo">⬢ PIXEL ENGINE <span style="color:#9d7dff;font-size:11px;font-weight:600;letter-spacing:1px">v6.2.17 PRO</span></span>
     <span class="spacer"></span>
     <!-- v6.2.2: o antigo "＋ Obj" da toolbar foi REMOVIDO. O botão de adicionar
          objeto agora é uma CTA gradiente fixa no topo da aba "Objetos". -->
@@ -1242,6 +1242,56 @@ const Engine = (function(){
   function applyRotationLocks(scene){
     if(!scene || !scene.objects) return;
     for(const o of scene.objects){
+      // v6.2.16 — TIPO DE ROTAÇÃO (rotationType). Roda ANTES do
+      // rotationLock antigo, então os dois sistemas convivem. O tipo
+      // controla COMO o ângulo cru do objeto vira "rotação visível":
+      //   "all"        → rotação livre 360° (default; não mexe).
+      //   "horizontal" → ignora ângulo, só usa flipX (esquerda/direita).
+      //   "locked"     → ignora rotação (força ângulo = 0).
+      //   "limited"    → impede ficar de cabeça pra baixo. Mantém ângulo
+      //                  em [-90°, +90°]. Quando o ângulo desejado passa
+      //                  disso, espelha o sprite com flipX e usa o ângulo
+      //                  refletido (180-θ) — igual armas/personagens de
+      //                  plataforma estilo GDevelop/Unity.
+      // v6.2.16 — TIPO DE ROTAÇÃO. Importante: NÃO sobrescrevemos
+      // o.angle / o.flipX (isso quebrava o "limited" — no frame seguinte
+      // o ângulo já-espelhado entrava na faixa válida e desativava o
+      // flipX, criando piscar). Em vez disso escrevemos APENAS valores
+      // de DISPLAY: _dispAngle e _dispFlipX. O renderer usa esses se
+      // existirem; senão cai pra obj.angle / obj.flipX. Assim, set_angle,
+      // aim_at, rotate_by e flip_x continuam funcionando intactos.
+      const rtype = o.rotationType;
+      if(rtype && rtype !== "all"){
+        const aDeg = (typeof o.angle === "number" ? o.angle : 0) * 180 / Math.PI;
+        // Normaliza pra (-180, 180].
+        let n = ((aDeg + 180) % 360 + 360) % 360 - 180;
+        if(rtype === "locked"){
+          o._dispAngle = 0;
+          o._dispFlipX = !!o.flipX;
+        } else if(rtype === "horizontal"){
+          // flipX combina o flipX do usuário com a direção do ângulo
+          // (XOR: se usuário setou flipX e ângulo aponta pra esquerda,
+          // ficam visualmente apontando pra direita).
+          const facingLeft = (n > 90 || n < -90);
+          o._dispFlipX = (!!o.flipX) !== facingLeft;
+          o._dispAngle = 0;
+        } else if(rtype === "limited"){
+          if(n > 90 || n < -90){
+            // Espelha em torno do eixo vertical: 180 - n.
+            let mirrored = 180 - n;
+            mirrored = ((mirrored + 180) % 360 + 360) % 360 - 180;
+            o._dispAngle = mirrored * Math.PI / 180;
+            o._dispFlipX = !o.flipX;
+          } else {
+            o._dispAngle = o.angle;
+            o._dispFlipX = !!o.flipX;
+          }
+        }
+      } else {
+        // "all" ou indefinido: limpa display pra renderer cair no fallback.
+        if(o._dispAngle !== undefined) o._dispAngle = undefined;
+        if(o._dispFlipX !== undefined) o._dispFlipX = undefined;
+      }
       const lk = o.rotationLock;
       if(!lk || !lk.enabled) continue;
       const deg = (typeof o.angle === "number" ? o.angle : 0) * 180 / Math.PI;
@@ -1652,11 +1702,15 @@ const Engine = (function(){
     // Pixel-perfect translate when not rotated (avoids sub-pixel sampling
     // jitter); preserve full float when rotating because rotation already
     // lands fragments off-grid anyway.
-    const tx = obj.angle ? obj.x : Math.round(obj.x);
-    const ty = obj.angle ? obj.y : Math.round(obj.y);
+    // v6.2.16 — Prefer display values from applyRotationLocks (set when
+    // rotationType ≠ "all"); fall back to obj.angle / obj.flipX.
+    const _ang = (obj._dispAngle !== undefined) ? obj._dispAngle : obj.angle;
+    const _flx = (obj._dispFlipX !== undefined) ? obj._dispFlipX : obj.flipX;
+    const tx = _ang ? obj.x : Math.round(obj.x);
+    const ty = _ang ? obj.y : Math.round(obj.y);
     ctx.translate(tx, ty);
-    if(obj.angle) ctx.rotate(obj.angle);
-    const sx = obj.scaleX * (obj.flipX?-1:1);
+    if(_ang) ctx.rotate(_ang);
+    const sx = obj.scaleX * (_flx?-1:1);
     const sy = obj.scaleY * (obj.flipY?-1:1);
     ctx.scale(sx, sy);
     // v6 PRO: ADAPTIVE smoothing. Nearest-neighbor (smoothing OFF) is great
@@ -1809,7 +1863,9 @@ const Engine = (function(){
     ctx.save();
     ctx.globalAlpha = 0.4;
     ctx.translate(obj.x + ox, obj.y + oy);
-    if(obj.angle) ctx.rotate(obj.angle);
+    // v6.2.16 — shadow segue o ângulo de display (rotationType).
+    const _shAng = (obj._dispAngle !== undefined) ? obj._dispAngle : obj.angle;
+    if(_shAng) ctx.rotate(_shAng);
     ctx.scale(obj.scaleX*1.05, obj.scaleY*0.6);
     ctx.fillStyle = "#000";
     ctx.beginPath();
@@ -2711,6 +2767,18 @@ const Engine = (function(){
       case "unlock_rotation": if(obj){
         if(obj.rotationLock) obj.rotationLock.enabled = false;
       } break;
+      // v6.2.16 — DEFINIR TIPO DE ROTAÇÃO. Diferente do "lock_rotation"
+      // (que clampa min/máx em graus), este define o COMPORTAMENTO global
+      // de rotação do objeto: livre, só horizontal (flipX), bloqueado,
+      // ou limitado (-90..+90 com flipX automático). A engine aplica em
+      // applyRotationLocks() todo frame, então não interfere em set_angle,
+      // aim_at, rotate_by ou tween_to angle — só "corrige" o resultado
+      // antes de renderizar.
+      case "set_rotation_type": if(obj){
+        const v = String(action.value || "all").toLowerCase();
+        const valid = (v === "all" || v === "horizontal" || v === "locked" || v === "limited");
+        obj.rotationType = valid ? v : "all";
+      } break;
       case "set_visible": if(obj) obj.visible = action.value === "true" || action.value === true; break;
       case "flip_x": if(obj) obj.flipX = !obj.flipX; break;
       case "flip_y": if(obj) obj.flipY = !obj.flipY; break;
@@ -2748,14 +2816,15 @@ const Engine = (function(){
           ? Number(action.toStrength) : 0;
         Tween.startColor(runtime, obj, toCol, fromS, toS, dur, easing);
       } break;
-      // Variables
-      case "set_var": scene.variables[action.name] = Number(action.value); break;
-      case "add_var": scene.variables[action.name] = (Number(scene.variables[action.name])||0) + Number(action.value); break;
+      // Variables — v6.2.16: aceitam EXPRESSÕES (Player.X(), variáveis, etc.)
+      case "set_var": scene.variables[action.name] = Number(evalExpr(action.value, scene)); break;
+      case "add_var": scene.variables[action.name] = (Number(scene.variables[action.name])||0) + Number(evalExpr(action.value, scene)); break;
       // Camera
       case "cam_zoom": {
+        // v6.2.16 — agora aceita expressões (ex.: 1+VarZoom, Player.X()/100).
         // Instant zoom — snap both zoom and targetZoom so the smooth lerp
         // doesn't spring back to an old target.
-        const z = Number(action.value);
+        const z = Number(evalExpr(action.value, scene));
         if(!isNaN(z) && z > 0){
           runtime.camera.zoom = z;
           runtime.camera.targetZoom = z;
@@ -2763,24 +2832,47 @@ const Engine = (function(){
         break;
       }
       case "cam_zoom_smooth": {
+        // v6.2.16 — value e speed agora aceitam expressões.
         // Smooth zoom — set the target, leave .zoom alone so updateCamera
         // lerps towards it. Optional "speed" overrides camera.zoomSpeed.
-        const z = Number(action.value);
+        const z = Number(evalExpr(action.value, scene));
         if(!isNaN(z) && z > 0) runtime.camera.targetZoom = z;
         if(action.speed != null && action.speed !== ""){
-          const sp = Number(action.speed);
+          const sp = Number(evalExpr(action.speed, scene));
           if(!isNaN(sp) && sp > 0) runtime.camera.zoomSpeed = Math.max(0, Math.min(1, sp));
         }
         break;
       }
       case "cam_zoom_add": {
+        // v6.2.16 — variação aceita expressões.
         // Additive smooth zoom — push the target by delta.
-        const dz = Number(action.value);
+        const dz = Number(evalExpr(action.value, scene));
         if(!isNaN(dz)){
           const next = (runtime.camera.targetZoom ?? runtime.camera.zoom) + dz;
           // Clamp to a reasonable positive range so the camera can't invert.
           runtime.camera.targetZoom = Math.max(0.05, next);
         }
+        break;
+      }
+      // v6.2.16 — Definir posição da câmera por expressão (X / Y / ambos).
+      // Sobrescreve o "Seguir objeto" do frame atual. Se quiser seguir de
+      // novo, basta parar de chamar essa ação. Compatível com expressões
+      // como Player.X(), (Player.X()+Boss.X())/2, CameraCenterX()+Var, etc.
+      case "cam_set_x": {
+        const x = Number(evalExpr(action.value, scene));
+        if(!isNaN(x)) runtime.camera.x = x;
+        break;
+      }
+      case "cam_set_y": {
+        const y = Number(evalExpr(action.value, scene));
+        if(!isNaN(y)) runtime.camera.y = y;
+        break;
+      }
+      case "cam_set_position": {
+        const cx = Number(evalExpr(action.x, scene));
+        const cy = Number(evalExpr(action.y, scene));
+        if(!isNaN(cx)) runtime.camera.x = cx;
+        if(!isNaN(cy)) runtime.camera.y = cy;
         break;
       }
       case "cam_follow": {
@@ -2823,7 +2915,13 @@ const Engine = (function(){
         }
       } break;
       case "cam_limits_clear": runtime.camera.bounds = null; break;
-      case "cam_shake": runtime.camera.shakeAmount = Number(action.value); runtime.camera.shakeDuration = Number(action.duration ?? 0.4); break;
+      case "cam_shake": {
+        // v6.2.16 — intensidade e duração aceitam expressões.
+        const amt = Number(evalExpr(action.value, scene));
+        const dur = (action.duration == null || action.duration === "") ? 0.4 : Number(evalExpr(action.duration, scene));
+        if(!isNaN(amt)) runtime.camera.shakeAmount = amt;
+        if(!isNaN(dur)) runtime.camera.shakeDuration = dur;
+      } break;
       // Particles
       case "emit_start": if(obj){ obj.emitter.enabled = true; obj.emitter.emitting = true; if(action.value) obj.emitter.type = action.value;} break;
       case "emit_stop": if(obj) obj.emitter.emitting = false; break;
@@ -6024,11 +6122,19 @@ const Editor = (function(){
         // menos uma animação válida selecionada como currentAnim.
         let animName = (o.currentAnim && o.animations[o.currentAnim]) ? o.currentAnim : "default";
         if(!o.animations[animName]) o.animations[animName] = {frames:[], speed:0.1, loop:true};
-        // v6.2.13 — Lembra se a animação ainda estava vazia ANTES de adicionar
-        // os novos frames. Só nesse caso (primeira imagem do objeto) o objeto
-        // recebe o tamanho natural do sprite. Se já havia frames e o usuário
-        // resizou o objeto, preservamos a escala definida por ele.
-        const wasEmpty = (o.animations[animName].frames.length === 0);
+        // v6.2.16 — BUGFIX: o "wasEmpty" antigo só olhava ESTA animação. Se o
+        // objeto já tinha OUTRAS animações com frames (e o usuário tinha
+        // ajustado tamanho/escala), criar uma nova animação resetava
+        // width/height pro tamanho natural do sprite e o ator "encolhia"
+        // (porque o scaleX/scaleY do usuário era aplicado em cima). Agora só
+        // setamos width/height se o OBJETO INTEIRO ainda não tinha NENHUM
+        // frame em NENHUMA animação — ou seja, é a primeira imagem dele.
+        let _objHadFrames = false;
+        for(const _k in o.animations){
+          const _a = o.animations[_k];
+          if(_a && _a.frames && _a.frames.length > 0){ _objHadFrames = true; break; }
+        }
+        const wasEmpty = !_objHadFrames;
         let added = 0, lastW = 0, lastH = 0;
         for(const r of results){
           if(!r) continue;
@@ -6745,6 +6851,7 @@ const Editor = (function(){
       // v6.2.14 — Travar rotação. ieText pra aceitar expressão ou vazio.
       lock_rotation:tgt+" travar rotação min = "+ieText(P("min"), a.min, "vazio")+"° máx = "+ieText(P("max"), a.max, "vazio")+"°",
       unlock_rotation:tgt+" destravar rotação",
+      set_rotation_type:tgt+" tipo de rotação = "+ieSelect(P("value"), a.value||"all", [["all","Todas (360°)"],["horizontal","Esq/Dir (flipX)"],["locked","Bloqueado"],["limited","Limitado (-90..+90, espelha)"]]),
       // v6.2.15 — Apontar para outro objeto (com offset opcional).
       aim_at:tgt+" apontar para "+ieObj(P("targetId"), a.targetId, "(alvo)")+" offset "+ieNum(P("offset"), a.offset, {def:0})+"°",
       // v6.2.15 — Tween de cor (flash). cor + duração + intensidade.
@@ -6768,16 +6875,19 @@ const Editor = (function(){
       stop_control:tgt+" parar movimento",
       simulate_key:"Simular tecla "+ieSelect(P("value"), a.value||"left", [["left","Esquerda"],["right","Direita"],["jump","Pular"]])+" (pressionar)",
       simulate_key_release:"Simular tecla "+ieSelect(P("value"), a.value||"left", [["left","Esquerda"],["right","Direita"],["jump","Pular"]])+" (soltar)",
-      set_var:"Var "+ieText(P("name"), a.name, "score")+" = "+ieNum(P("value"), a.value, {def:1}),
-      add_var:"Var "+ieText(P("name"), a.name, "score")+" += "+ieNum(P("value"), a.value, {def:1}),
-      cam_zoom:"Câmera zoom = "+ieNum(P("value"), a.value, {def:1}),
-      cam_zoom_smooth:"Câmera zoom suave → "+ieNum(P("value"), a.value, {def:1})+" (vel "+ieNum(P("speed"), a.speed, {def:0.1})+")",
-      cam_zoom_add:"Câmera zoom += "+ieNum(P("value"), a.value, {def:0.1}),
+      set_var:"Var "+ieText(P("name"), a.name, "score")+" = "+ieText(P("value"), a.value, "1"),
+      add_var:"Var "+ieText(P("name"), a.name, "score")+" += "+ieText(P("value"), a.value, "1"),
+      cam_zoom:"Câmera zoom = "+ieText(P("value"), a.value, "1"),
+      cam_zoom_smooth:"Câmera zoom suave → "+ieText(P("value"), a.value, "1")+" (vel "+ieText(P("speed"), a.speed, "0.1")+")",
+      cam_zoom_add:"Câmera zoom += "+ieText(P("value"), a.value, "0.1"),
       cam_follow:"Câmera segue "+ieObj(P("objectId"), a.objectId, "(nenhum)")+" (suav "+ieNum(P("smoothing"), a.smoothing, {def:""})+")",
       cam_follow_two:"Câmera segue meio entre "+ieObj(P("objectId"), a.objectId, "(A)")+" e "+ieObj(P("objectId2"), a.objectId2, "(B)")+" (suav "+ieNum(P("smoothing"), a.smoothing, {def:""})+")",
+      cam_set_x:"Câmera X = "+ieText(P("value"), a.value, "Player.X()"),
+      cam_set_y:"Câmera Y = "+ieText(P("value"), a.value, "Player.Y()"),
+      cam_set_position:"Câmera posição → X="+ieText(P("x"), a.x, "Player.X()")+", Y="+ieText(P("y"), a.y, "Player.Y()"),
       cam_limits:"Câmera limites L="+ieNum(P("left"), a.left, {def:0})+" T="+ieNum(P("top"), a.top, {def:0})+" R="+ieNum(P("right"), a.right, {def:800})+" B="+ieNum(P("bottom"), a.bottom, {def:600}),
       cam_limits_clear:"Câmera limites: remover",
-      cam_shake:"Câmera tremer "+ieNum(P("value"), a.value, {def:6})+" por "+ieNum(P("duration"), a.duration, {def:0.4})+"s",
+      cam_shake:"Câmera tremer "+ieText(P("value"), a.value, "6")+" por "+ieText(P("duration"), a.duration, "0.4")+"s",
       emit_start:tgt+" emitir partículas ("+ieSelect(P("value"), a.value||"fire", [["fire","Fogo"],["smoke","Fumaça"],["explosion","Explosão"],["custom","Custom"]])+")",
       emit_stop:tgt+" parar partículas",
       light_on:tgt+" ligar luz",
@@ -7345,6 +7455,7 @@ const Editor = (function(){
         ["set_scale_y","Escala Y"],
         ["set_angle","Definir ângulo"],
         ["rotate_by","Rotacionar (Δ°)"],
+        ["set_rotation_type","Definir tipo de rotação"],
         ["lock_rotation","Travar rotação (min/máx)"],
         ["unlock_rotation","Destravar rotação"],
         // v6.2.15 — Apontar para outro objeto.
@@ -7389,6 +7500,9 @@ const Editor = (function(){
       ["CÂMERA", [
         ["cam_follow","Seguir objeto"],
         ["cam_follow_two","Seguir ponto médio entre 2 objetos"],
+        ["cam_set_x","Definir posição X da câmera (expressão)"],
+        ["cam_set_y","Definir posição Y da câmera (expressão)"],
+        ["cam_set_position","Definir posição da câmera (X e Y, expressão)"],
         ["cam_limits","Forçar limites da câmera"],
         ["cam_limits_clear","Remover limites da câmera"],
         ["cam_zoom","Definir zoom da câmera"],
@@ -7477,12 +7591,12 @@ const Editor = (function(){
   }
 
   function promptForAction(type, cb){
-    const objActions = ["set_x","set_y","set_position","add_x","add_y","set_vx","set_vy","force_x","force_y","set_anim","next_anim","set_frame","restart_anim","pause_anim","resume_anim","set_scale","set_scale_x","set_scale_y","set_opacity","set_angle","rotate_by","lock_rotation","unlock_rotation","aim_at","tween_color","set_visible","flip_x","flip_y","set_brightness","set_contrast","set_saturation","set_tint","emit_start","emit_stop","light_on","light_off","light_color","light_radius","light_intensity","reflection_on","reflection_off","destroy","create","platformer_jump","platformer_jump_force","set_move_speed","set_jump_force","set_jump_height","set_max_fall_speed","simulate_control","stop_control","float_start","float_stop"];
+    const objActions = ["set_x","set_y","set_position","add_x","add_y","set_vx","set_vy","force_x","force_y","set_anim","next_anim","set_frame","restart_anim","pause_anim","resume_anim","set_scale","set_scale_x","set_scale_y","set_opacity","set_angle","rotate_by","set_rotation_type","lock_rotation","unlock_rotation","aim_at","tween_color","set_visible","flip_x","flip_y","set_brightness","set_contrast","set_saturation","set_tint","emit_start","emit_stop","light_on","light_off","light_color","light_radius","light_intensity","reflection_on","reflection_off","destroy","create","platformer_jump","platformer_jump_force","set_move_speed","set_jump_force","set_jump_height","set_max_fall_speed","simulate_control","stop_control","float_start","float_stop"];
     let html = "";
     if(objActions.includes(type)) html += `<label>Objeto</label>${objSelectHtml("objectId","")}`;
     // Actions that accept full expressions (number OR "Hitbox.X() + 10")
-    const exprAct = ["set_x","set_y","add_x","add_y","set_vx","set_vy","force_x","force_y","set_scale","set_scale_x","set_scale_y","light_radius","light_intensity","set_global_brightness","set_global_contrast","set_global_saturation","set_move_speed","set_jump_force","set_max_fall_speed"];
-    const numAct = ["set_opacity","set_angle","rotate_by","set_brightness","set_contrast","set_saturation","cam_zoom","cam_zoom_add"];
+    const exprAct = ["set_x","set_y","add_x","add_y","set_vx","set_vy","force_x","force_y","set_scale","set_scale_x","set_scale_y","light_radius","light_intensity","set_global_brightness","set_global_contrast","set_global_saturation","set_move_speed","set_jump_force","set_max_fall_speed","cam_set_x","cam_set_y"];
+    const numAct = ["set_opacity","set_angle","rotate_by","set_brightness","set_contrast","set_saturation"];
     const strAct = ["set_anim","next_anim","light_color"];
     if(exprAct.includes(type)){
       html += `<label style="margin-top:8px">Valor ou expressão</label><input name="value" type="text" value="0" placeholder="0  ou  Hitbox.X() + 10">
@@ -7565,8 +7679,27 @@ const Editor = (function(){
     if(type==="unlock_rotation"){
       html += `<div class="help" style="margin-top:6px">Libera a rotação que estava travada por <b>Travar rotação</b>. Não muda o ângulo atual.</div>`;
     }
+    // v6.2.16 — DEFINIR TIPO DE ROTAÇÃO. Controla COMO o objeto vira na
+    // tela. "Limitado" é o modo recomendado pra players e armas — impede
+    // o sprite de virar de cabeça pra baixo (estilo GDevelop / Unity).
+    if(type==="set_rotation_type"){
+      html += `<label style="margin-top:8px">Tipo</label>
+               <select name="value">
+                 <option value="all">Todas as direções (360° livre)</option>
+                 <option value="horizontal">Esquerda / Direita (só flipX)</option>
+                 <option value="locked">Bloqueado (sem rotação)</option>
+                 <option value="limited" selected>Limitado (-90°..+90°, espelha em vez de inverter)</option>
+               </select>
+               <div class="help" style="margin-top:6px">
+                 <b>Todas</b>: rotação livre 360° (default).<br>
+                 <b>Esquerda/Direita</b>: ignora o ângulo e só usa <code>flipX</code> baseado na direção (ideal pra inimigos/players só com sprite virado).<br>
+                 <b>Bloqueado</b>: ignora qualquer rotação (ângulo = 0).<br>
+                 <b>Limitado</b>: o sprite NUNCA fica de cabeça pra baixo. Quando o ângulo desejado passa de ±90°, a engine espelha o sprite com <code>flipX</code> e usa o ângulo refletido. Combine com <b>Apontar para objeto</b> ou <b>Definir ângulo</b>.
+               </div>`;
+    }
     if(type==="emit_start") html += `<label style="margin-top:8px">Tipo</label><select name="value"><option value="fire">Fogo</option><option value="smoke">Fumaça</option><option value="explosion">Explosão</option><option value="custom">Custom</option></select>`;
-    if(type==="set_var"||type==="add_var") html += `<label>Nome</label><input name="name" placeholder="score"><label style="margin-top:8px">Valor</label><input name="value" type="number" value="1">`;
+    if(type==="set_var"||type==="add_var") html += `<label>Nome</label><input name="name" placeholder="score"><label style="margin-top:8px">Valor ou expressão</label><input name="value" type="text" value="1" placeholder="1  ou  Player.X() + 10">
+      <div class="help" style="margin-top:4px">Aceita números OU expressões. Ex.: <code>Player.X()</code>, <code>(Player.X()+Inimigo.X())/2</code>, <code>Pontos+1</code>, <code>MouseX()</code>.</div>`;
     if(type==="cam_follow") {
       html = `<label>Objeto a seguir</label>${objSelectHtml("objectId","")}
               <label style="margin-top:8px">Suavização (0..1, vazio = manter)</label>
@@ -7592,20 +7725,28 @@ const Editor = (function(){
     if(type==="cam_limits_clear") {
       html = `<div class="help">Remove os limites — a câmera volta a se mover livremente.</div>`;
     }
-    if(type==="cam_shake") html = `<label>Intensidade</label><input name="value" type="number" step="0.5" value="6"><label style="margin-top:8px">Duração (s)</label><input name="duration" type="number" step="0.1" value="0.4">`;
+    if(type==="cam_shake") html = `<label>Intensidade</label><input name="value" type="text" value="6" placeholder="6  ou  Player.life()/10">
+              <label style="margin-top:8px">Duração (s)</label><input name="duration" type="text" value="0.4" placeholder="0.4">
+              <div class="help" style="margin-top:4px">Aceita números OU expressões.</div>`;
     if(type==="cam_zoom"){
-      html = `<label>Zoom (1 = normal, 2 = 2x, 0.5 = afastado)</label><input name="value" type="number" step="0.1" min="0.05" value="1">
-              <div class="help" style="margin-top:6px">Aplica o zoom INSTANTANEAMENTE.</div>`;
+      html = `<label>Zoom (1 = normal, 2 = 2x, 0.5 = afastado)</label><input name="value" type="text" value="1" placeholder="1  ou  1+Pontos/100">
+              <div class="help" style="margin-top:6px">Aplica o zoom INSTANTANEAMENTE. Aceita expressões.</div>`;
     }
     if(type==="cam_zoom_smooth"){
-      html = `<label>Zoom alvo</label><input name="value" type="number" step="0.1" min="0.05" value="2">
+      html = `<label>Zoom alvo</label><input name="value" type="text" value="2" placeholder="2  ou  2+sin(Time)*0.2">
               <label style="margin-top:8px">Velocidade (0.01 lento → 1 instantâneo, opcional)</label>
-              <input name="speed" type="number" step="0.01" min="0" max="1" value="0.1">
-              <div class="help" style="margin-top:6px">A câmera interpola até o zoom alvo a cada frame.</div>`;
+              <input name="speed" type="text" value="0.1" placeholder="0.1">
+              <div class="help" style="margin-top:6px">A câmera interpola até o zoom alvo a cada frame. Ambos aceitam expressões.</div>`;
     }
     if(type==="cam_zoom_add"){
-      html = `<label>Variação no zoom (ex: 0.1 ou -0.2)</label><input name="value" type="number" step="0.05" value="0.1">
-              <div class="help" style="margin-top:6px">Soma ao zoom alvo (suave).</div>`;
+      html = `<label>Variação no zoom (ex: 0.1 ou -0.2)</label><input name="value" type="text" value="0.1" placeholder="0.1  ou  -Pontos/200">
+              <div class="help" style="margin-top:6px">Soma ao zoom alvo (suave). Aceita expressões.</div>`;
+    }
+    // v6.2.16 — Posição da câmera por expressão.
+    if(type==="cam_set_position"){
+      html = `<label>X (expressão)</label><input name="x" type="text" value="Player.X()" placeholder="Player.X()  ou  (P1.X()+P2.X())/2">
+              <label style="margin-top:8px">Y (expressão)</label><input name="y" type="text" value="Player.Y()" placeholder="Player.Y()">
+              <div class="help" style="margin-top:6px">Define X e Y da câmera por expressão. Sobrescreve o "Seguir objeto" enquanto for chamada. Aceita <code>Player.X()</code>, <code>CameraCenterX()+Var</code>, <code>(A.X()+B.X())/2</code>, etc.</div>`;
     }
     if(type==="timer_reset") html = `<label>Nome do timer</label><input name="name" placeholder="game">`;
     if(type==="create") html += `<label style="margin-top:8px">X</label><input name="x" type="number" step="any" value="100"><label style="margin-top:8px">Y</label><input name="y" type="number" step="any" value="100">`;
@@ -8038,11 +8179,18 @@ const Editor = (function(){
         });
 
         Promise.all(files.map(readOne)).then(results=>{
-          // v6.2.13 — Lembra se a animação estava vazia antes de adicionar.
-          // Só nesse caso (primeiro frame da animação) o objeto recebe o
-          // tamanho natural do sprite. Se já tinha frames e o usuário resizou
-          // o objeto na cena, preservamos a escala definida por ele.
-          const wasEmpty = (o.animations[name].frames.length === 0);
+          // v6.2.16 — BUGFIX: olha TODAS as animações do objeto, não só a
+          // que está recebendo o frame. Antes, criar uma NOVA animação num
+          // objeto que já tinha sprite + escala custom resetava o tamanho
+          // pro tamanho natural da imagem nova e o ator visualmente
+          // "encolhia". Agora só sincronizamos width/height se o objeto
+          // INTEIRO ainda estava sem nenhum frame.
+          let _objHadFrames = false;
+          for(const _k in o.animations){
+            const _a = o.animations[_k];
+            if(_a && _a.frames && _a.frames.length > 0){ _objHadFrames = true; break; }
+          }
+          const wasEmpty = !_objHadFrames;
           let added = 0, lastW = 0, lastH = 0;
           for(const r of results){
             if(!r) continue;
@@ -8052,8 +8200,9 @@ const Editor = (function(){
           }
           if(added){
             if(!o.currentAnim) o.currentAnim = name;
-            // Sincroniza dims do objeto com o último frame válido
-            // (preserva proporção). Use scaleX/scaleY pra redimensionar.
+            // Sincroniza dims do objeto com o último frame válido APENAS
+            // quando o objeto não tinha nenhum sprite ainda (preserva
+            // escala configurada pelo usuário).
             if(wasEmpty){
               if(lastW){ o.width  = lastW; }
               if(lastH){ o.height = lastH; }
